@@ -32,6 +32,8 @@ class CloudMailAccount:
 
 
 _CONTEXT_CACHE: dict[str, CloudMailAccount] = {}
+_DOMAIN_CACHE: tuple[float, list[str]] | None = None
+DOMAIN_CACHE_TTL = 300
 
 
 def _cache_key(email: str) -> str:
@@ -125,17 +127,11 @@ def login(username: str | None = None, password: str | None = None, path: str | 
 
 def _domains() -> list[str]:
     raw = getattr(_email_cfg, "CLOUDMAIL_DOMAINS", []) or []
-    if isinstance(raw, str):
-        parts = raw.replace(";", "\n").replace(",", "\n").splitlines()
-    else:
-        parts = list(raw)
-    out = []
-    for item in parts:
-        domain = str(item or "").strip().lower().lstrip("@")
-        if domain and "." in domain and domain not in out:
-            out.append(domain)
+    out = _normalize_domains(raw)
     if not out:
-        raise CloudMailError("CloudMail 邮箱域名列表为空，请配置 CLOUDMAIL_DOMAINS。")
+        out = fetch_domains()
+    if not out:
+        raise CloudMailError("CloudMail 邮箱域名列表为空，且未能从平台自动获取。")
     return out
 
 
@@ -161,6 +157,117 @@ def _request(path: str, body: dict | None = None):
         message = payload.get("message") if isinstance(payload, dict) else ""
         raise CloudMailError(f"CloudMail 请求失败 ({path}): HTTP {resp.status_code}; code={code}; {message or str(payload)[:200]}")
     return payload.get("data")
+
+
+def _request_raw(method: str, path: str, *, body: dict | None = None, token: str | None = None):
+    url = _base_url() + path
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = token
+    try:
+        if method.upper() == "GET":
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        else:
+            resp = requests.post(url, json=body or {}, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        raise CloudMailError(f"CloudMail 请求失败 ({path}): {type(exc).__name__}: {exc}") from exc
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise CloudMailError(f"CloudMail 响应不是 JSON ({path}): HTTP {resp.status_code}") from exc
+
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if resp.status_code >= 400 or code not in (200, "200", None):
+        message = payload.get("message") if isinstance(payload, dict) else ""
+        raise CloudMailError(f"CloudMail 请求失败 ({path}): HTTP {resp.status_code}; code={code}; {message or str(payload)[:200]}")
+    return payload
+
+
+def _normalize_domains(raw) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = raw.replace(";", "\n").replace(",", "\n").splitlines()
+    elif isinstance(raw, dict):
+        parts = []
+        for key in ("domain", "name", "value", "emailDomain"):
+            if raw.get(key):
+                parts.append(raw.get(key))
+    else:
+        try:
+            parts = list(raw)
+        except TypeError:
+            parts = [raw]
+    out = []
+    for item in parts:
+        if isinstance(item, dict):
+            candidates = [item.get(k) for k in ("domain", "name", "value", "emailDomain")]
+        else:
+            candidates = [item]
+        for candidate in candidates:
+            domain = str(candidate or "").strip().lower().lstrip("@")
+            if domain and "." in domain and " " not in domain and domain not in out:
+                out.append(domain)
+    return out
+
+
+def _extract_domains(payload) -> list[str]:
+    if not isinstance(payload, dict):
+        return _normalize_domains(payload)
+    data = payload.get("data") if "data" in payload else payload
+    candidates = []
+    if isinstance(data, dict):
+        for key in ("domainList", "domains", "domain", "emailDomains", "mailDomains", "availDomains"):
+            candidates.append(data.get(key))
+    candidates.append(data)
+    for item in candidates:
+        domains = _normalize_domains(item)
+        if domains:
+            return domains
+    return []
+
+
+def _login_token() -> str:
+    email = str(getattr(_email_cfg, "CLOUDMAIL_ADMIN_EMAIL", "") or "").strip()
+    password = str(getattr(_email_cfg, "CLOUDMAIL_PASSWORD", "") or "").strip()
+    if not email or not password:
+        raise CloudMailError("CloudMail 管理员邮箱或密码为空，无法登录获取域名列表")
+    payload = _request_raw("POST", "/api/login", body={"email": email, "password": password})
+    token = _extract_token(payload)
+    logger.info("[CloudMail] 管理员登录成功，可用于获取隐藏域名列表")
+    return token
+
+
+def fetch_domains(force: bool = False) -> list[str]:
+    """从 CloudMail 平台获取可用邮箱域名列表。
+
+    优先读取公开网站配置 `/api/setting/websiteConfig`；如果站点开启了登录页隐藏域名，
+    再用管理员账号登录并读取 `/api/setting/query`。
+    """
+    global _DOMAIN_CACHE
+    now = time.monotonic()
+    if not force and _DOMAIN_CACHE and now - _DOMAIN_CACHE[0] < DOMAIN_CACHE_TTL:
+        return list(_DOMAIN_CACHE[1])
+
+    errors: list[str] = []
+    for method, path, token in (
+        ("GET", "/api/setting/websiteConfig", None),
+        ("GET", "/api/setting/query", "__login__"),
+    ):
+        try:
+            auth = _login_token() if token == "__login__" else token
+            payload = _request_raw(method, path, token=auth)
+            domains = _extract_domains(payload)
+            if domains:
+                _DOMAIN_CACHE = (now, domains)
+                logger.info("[CloudMail] 已从平台获取可用域名：%s", ",".join(domains))
+                return list(domains)
+            errors.append(f"{path}: 响应中没有 domainList")
+        except Exception as exc:
+            errors.append(f"{path}: {type(exc).__name__}: {exc}")
+
+    raise CloudMailError("CloudMail 自动获取域名失败：" + "；".join(errors))
 
 
 def _random_local_part(length: int | None = None) -> str:

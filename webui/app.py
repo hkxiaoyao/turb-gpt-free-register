@@ -770,7 +770,12 @@ def create_app() -> Flask:
     @app.get("/api/jobs")
     def api_jobs():
         limit = request.args.get("limit", default=100, type=int)
-        return jsonify(db.list_jobs(limit=limit))
+        from config import email as _email_cfg
+        manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
+        rows = db.list_jobs(limit=limit)
+        for row in rows:
+            row["manual_otp_required"] = manual_otp_required
+        return jsonify(rows)
 
     @app.post("/api/jobs")
     def api_jobs_create():
@@ -837,9 +842,6 @@ def create_app() -> Flask:
         if "cloudmail" in sources:
             api_base = str(getattr(_email_cfg, "CLOUDMAIL_API_BASE", "") or "").strip()
             token = str(getattr(_email_cfg, "CLOUDMAIL_AUTH_TOKEN", "") or "").strip()
-            domains = getattr(_email_cfg, "CLOUDMAIL_DOMAINS", []) or []
-            if isinstance(domains, str):
-                domains = [x.strip() for x in domains.replace(",", "\n").splitlines() if x.strip()]
             if not api_base:
                 return jsonify({
                     "ok": False,
@@ -849,11 +851,6 @@ def create_app() -> Flask:
                 return jsonify({
                     "ok": False,
                     "error": "已选择 cloudmail 邮箱来源，请填写 CloudMail Token（配置 → 邮箱 / OTP）。",
-                }), 400
-            if not domains:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 cloudmail 邮箱来源，请填写 CloudMail 域名列表（配置 → 邮箱 / OTP）。",
                 }), 400
         if "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources:
             # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
@@ -1048,6 +1045,50 @@ def create_app() -> Flask:
             })
         except Exception as exc:
             logger.exception("生成 CloudMail Token 失败")
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
+    @app.post("/api/cloudmail/domains")
+    def api_cloudmail_domains():
+        """从 CloudMail 平台获取域名列表，并可写入 .env 作为本地缓存。"""
+        data = request.get_json(silent=True) or {}
+        try:
+            from core.cloudmail_client import fetch_domains
+            from config.env_loader import write_env_values
+
+            updates = {}
+            api_base = (data.get("api_base") or "").strip()
+            admin_email = (data.get("email") or data.get("admin_email") or "").strip()
+            password = (data.get("password") or "").strip()
+            token = (data.get("token") or "").strip()
+            if api_base:
+                updates["CLOUDMAIL_API_BASE"] = api_base
+            if admin_email:
+                updates["CLOUDMAIL_ADMIN_EMAIL"] = admin_email
+            if password:
+                updates["CLOUDMAIL_PASSWORD"] = password
+            if token:
+                updates["CLOUDMAIL_AUTH_TOKEN"] = token
+            if updates:
+                write_env_values(updates)
+                import config as _config_pkg
+                _config_pkg.reload_all()
+
+            domains = fetch_domains(force=True)
+            written = write_env_values({"CLOUDMAIL_DOMAINS": "\n".join(domains)})
+            try:
+                import config as _config_pkg
+                _config_pkg.reload_all()
+            except Exception:
+                logger.exception("CloudMail 域名写入后热加载失败")
+            return jsonify({
+                "ok": True,
+                "domains": domains,
+                "count": len(domains),
+                "written": written,
+                "message": f"已获取 {len(domains)} 个 CloudMail 可用域名并保存",
+            })
+        except Exception as exc:
+            logger.exception("获取 CloudMail 域名失败")
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
 
     @app.post("/api/config")

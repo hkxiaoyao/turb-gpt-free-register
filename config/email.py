@@ -20,7 +20,7 @@ USE_EMAIL_SERVICE = False
 #   "generic_api"       — 通用 API 取码邮箱池（邮箱----取码地址）
 #   "gptmail"           — GPTMail 临时邮箱 API（运行时随机生成邮箱并自动收码）
 #   "mailnest"          — MailNest/迈巢临时邮箱 API（运行时购买邮箱并自动收码）
-#   "cloudmail"           — CloudMail/Cloud Mail API（从域名列表随机生成邮箱并自动收码）
+#   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 
 
@@ -98,7 +98,7 @@ MAIL_NEST_PROJECT_CODE = "chatgpt001"
 # Cloud Mail Worker/API 地址，例如：https://mail.example.com
 CLOUDMAIL_API_BASE = ""
 
-# CloudMail 管理员邮箱/密码；配置页填写后保存时会自动换取 CLOUDMAIL_AUTH_TOKEN。
+# CloudMail 管理员邮箱/密码；用于手动生成 Token，也用于域名被隐藏时自动登录获取域名。
 CLOUDMAIL_ADMIN_EMAIL = env_str("CLOUDMAIL_ADMIN_EMAIL", "")
 CLOUDMAIL_PASSWORD = env_str("CLOUDMAIL_PASSWORD", "")
 
@@ -108,7 +108,7 @@ CLOUDMAIL_TOKEN_PATH = "/api/public/genToken"
 # CloudMail/Cloud Mail API Authorization Token；可手动填写，也可由账号密码自动获取。
 CLOUDMAIL_AUTH_TOKEN = env_str("CLOUDMAIL_AUTH_TOKEN", "")
 
-# 邮箱域名列表，每行一个或用英文逗号分隔；获取邮箱时随机生成 local@domain。
+# 邮箱域名列表，每行一个或用英文逗号分隔；可留空，运行时会从 CloudMail 平台自动获取。
 CLOUDMAIL_DOMAINS = []
 
 # 生成邮箱后是否调用 /api/public/addUser 创建邮箱用户。

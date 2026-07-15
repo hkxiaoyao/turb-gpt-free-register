@@ -79,7 +79,7 @@ class GPTMailWebUiTests(unittest.TestCase):
         submit_registration.assert_called_once_with(count=1, workers=1)
 
     @patch("webui.app.svc.submit_registration")
-    def test_jobs_rejects_cloudmail_without_domains_before_creating_tasks(self, submit_registration):
+    def test_jobs_allows_cloudmail_without_manual_domains(self, submit_registration):
         submit_registration.return_value = []
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "cloudmail"
@@ -88,9 +88,9 @@ class GPTMailWebUiTests(unittest.TestCase):
         ), patch.object(email_config, "CLOUDMAIL_DOMAINS", [], create=True):
             response = self.client.post("/api/jobs", json={"count": 1, "workers": 1})
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("CloudMail 域名列表", response.get_json()["error"])
-        submit_registration.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["warning"], "")
+        submit_registration.assert_called_once_with(count=1, workers=1)
 
     @patch("webui.app.db.outlook_pool_summary")
     @patch("webui.app.svc.submit_registration", return_value=[{"id": 1}])

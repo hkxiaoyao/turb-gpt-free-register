@@ -8,13 +8,29 @@ from core import cloudmail_client
 class CloudMailClientTests(unittest.TestCase):
     def setUp(self):
         cloudmail_client._CONTEXT_CACHE.clear()
+        cloudmail_client._DOMAIN_CACHE = None
 
     def test_pick_account_requires_domains(self):
         with patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_API_BASE", "https://mail.example.com", create=True), patch.object(
             cloudmail_client._email_cfg, "CLOUDMAIL_AUTH_TOKEN", "token", create=True
-        ), patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_DOMAINS", [], create=True):
-            with self.assertRaisesRegex(cloudmail_client.CloudMailError, "域名列表为空"):
+        ), patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_DOMAINS", [], create=True), patch(
+            "core.cloudmail_client.fetch_domains",
+            side_effect=cloudmail_client.CloudMailError("CloudMail 自动获取域名失败：域名列表为空"),
+        ):
+            with self.assertRaisesRegex(cloudmail_client.CloudMailError, "自动获取域名失败"):
                 cloudmail_client.pick_account()
+
+    @patch("core.cloudmail_client.requests.get")
+    def test_fetch_domains_reads_website_config(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": 200, "data": {"domainList": ["@example.com", "@mail.example.net"]}}
+        get.return_value = response
+
+        with patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_API_BASE", "https://mail.example.com", create=True):
+            domains = cloudmail_client.fetch_domains(force=True)
+
+        self.assertEqual(domains, ["example.com", "mail.example.net"])
+        get.assert_called_once()
 
     @patch("core.cloudmail_client.requests.post")
     @patch("core.cloudmail_client.secrets.choice", side_effect=list("bcdefghijklm"))

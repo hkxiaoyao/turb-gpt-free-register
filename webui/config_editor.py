@@ -273,7 +273,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CLOUDMAIL_ADMIN_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "CloudMail管理员邮箱", "help": "填写管理员邮箱和密码后保存，会立即调用 /api/public/genToken 获取 CloudMail Token",
+        "label": "CloudMail管理员邮箱", "help": "用于生成 Token；域名被平台隐藏时也会用它登录读取域名",
         "storage": "env",
     },
     {
@@ -292,7 +292,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CLOUDMAIL_DOMAINS", "file": "email.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
-        "label": "CloudMail 域名列表", "help": "每行一个邮箱域名；获取邮箱时随机生成 local@domain",
+        "label": "CloudMail 域名列表", "help": "可留空；运行时会自动从平台获取。也可点“获取 CloudMail 域名”缓存到这里",
     },
     {
         "key": "CLOUDMAIL_AUTO_ADD_USER", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
