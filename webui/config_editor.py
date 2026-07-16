@@ -111,6 +111,10 @@ EDITABLE_FIELDS = [
         "label": "操作超时(秒)", "help": "Playwright 默认操作超时",
     },
     {
+        "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
+        "label": "云端会话超时(秒)", "help": "传给 Browser Use connect URL 的 timeout；服务端有上限，程序会自动限制到 60-180，建议 180",
+    },
+    {
         "key": "BROWSER_USE_FAST_MODE", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
         "label": "快速模式", "help": "减少 Browser Use 额外等待和 humanize 延迟；建议开启，异常排查时可关闭",
     },

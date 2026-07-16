@@ -58,6 +58,7 @@ _CONTEXT_CACHE: dict[str, "OutlookAccount"] = {}
 # 远端 mail.chatai.codes 被禁用时，本进程内直接跳过远端，走 Microsoft Graph 直连。
 _REMOTE_DISABLED = False
 _MS_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_MS_TOKEN_FATAL_CACHE: dict[str, tuple[str, float]] = {}
 
 
 @dataclass
@@ -364,6 +365,44 @@ def _token_looks_jwt(token: str) -> bool:
     return str(token or "").count(".") >= 2
 
 
+def _ms_token_cache_key(account: OutlookAccount) -> str:
+    return f"{account.email}|{account.client_id}|{account.refresh_token[:24]}"
+
+
+def _is_oauth_fatal_error(text: str) -> bool:
+    s = str(text or "")
+    return (
+        "invalid_grant" in s
+        and (
+            "AADSTS70000" in s
+            or "AADSTS65001" in s
+            or "unauthorized or expired" in s
+            or "has not consented" in s
+        )
+    )
+
+
+def _compact_oauth_error(text: str) -> str:
+    s = str(text or "").replace("\\n", " ").strip()
+    if "AADSTS70000" in s:
+        return "AADSTS70000: refresh_token 未授权或授权已过期，无法换取所请求的 Graph/IMAP 读信 scope"
+    if "AADSTS65001" in s:
+        return "AADSTS65001: 当前 client_id 未获用户授权，无法访问该资源"
+    return s[:240]
+
+
+def _ms_token_fatal_reason(account: OutlookAccount) -> str | None:
+    key = _ms_token_cache_key(account)
+    cached = _MS_TOKEN_FATAL_CACHE.get(key)
+    if not cached:
+        return None
+    reason, expires_at = cached
+    if expires_at > time.time():
+        return reason
+    _MS_TOKEN_FATAL_CACHE.pop(key, None)
+    return None
+
+
 def _decode_email_header(header_value: str | None) -> str:
     if not header_value:
         return ""
@@ -460,7 +499,10 @@ def _ms_access_token(
     preferred_kind = str(preferred_kind or "").strip().lower() or None
     if preferred_kind not in (None, "graph", "outlook"):
         preferred_kind = None
-    cache_key = f"{account.email}|{account.client_id}|{account.refresh_token[:24]}"
+    cache_key = _ms_token_cache_key(account)
+    fatal_reason = _ms_token_fatal_reason(account)
+    if fatal_reason:
+        raise OutlookClientError(f"Microsoft OAuth refresh_token 换 token 失败: {fatal_reason}")
     cached = _MS_TOKEN_CACHE.get(cache_key)
     now = time.time()
     if cached and cached[1] - now > 120:
@@ -537,7 +579,57 @@ def _ms_access_token(
                 _MS_TOKEN_CACHE[cache_key] = (f"{kind}:{token}", now + max(300, expires_in - 60))
                 logger.debug("[Outlook] Microsoft token 获取成功 kind=%s jwt=%s", kind, _token_looks_jwt(token))
                 return token, kind
+        if _is_oauth_fatal_error(last_text):
+            reason = _compact_oauth_error(last_text)
+            _MS_TOKEN_FATAL_CACHE[cache_key] = (reason, time.time() + 600)
+            raise OutlookClientError(f"Microsoft OAuth refresh_token 换 token 失败: {reason}")
         raise OutlookClientError(f"Microsoft OAuth refresh_token 换 token 失败: {last_text}")
+    finally:
+        if own_http:
+            http.close()
+
+
+def _live_imap_access_token(account: OutlookAccount, http: CurlSession | None = None) -> str:
+    """使用 Outlook/Live OAuth 端点刷新 IMAP(New) access_token。
+
+    一些外购 Outlook 素材的 refresh_token 不能在 login.microsoftonline.com 换取
+    Graph/IMAP scope，但可以通过 login.live.com/oauth20_token.srf 不带 scope
+    换到 IMAP.AccessAsUser.All token；很多工具里叫 “IMAP (New)”。
+    """
+    cache_key = _ms_token_cache_key(account) + "|live_imap"
+    cached = _MS_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached[1] - now > 120:
+        token_kind, token = cached[0].split(":", 1) if ":" in cached[0] else ("live_imap", cached[0])
+        if token_kind == "live_imap":
+            return token
+
+    own_http = http is None
+    http = http or _ms_http()
+    try:
+        resp = http.post(
+            "https://login.live.com/oauth20_token.srf",
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            data=urlencode({
+                "client_id": account.client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": account.refresh_token,
+            }),
+        )
+        text = resp.text or ""
+        data = {}
+        try:
+            data = resp.json()
+        except Exception:
+            pass
+        token = str((data or {}).get("access_token") or "")
+        if resp.status_code == 200 and token:
+            expires_in = int((data or {}).get("expires_in") or 3600)
+            _MS_TOKEN_CACHE[cache_key] = (f"live_imap:{token}", now + max(300, expires_in - 60))
+            scope = str((data or {}).get("scope") or "")
+            logger.debug("[Outlook] Live IMAP(New) token 获取成功 scope=%s", scope[:160])
+            return token
+        raise OutlookClientError(f"Live IMAP(New) refresh_token 换 token 失败: {text[:500]}")
     finally:
         if own_http:
             http.close()
@@ -659,7 +751,13 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
     http = _ms_http()
     mail: imaplib.IMAP4_SSL | None = None
     try:
-        token, _kind = _ms_access_token(account, http=http, preferred_kind="outlook")
+        try:
+            token = _live_imap_access_token(account, http=http)
+            token_source = "live_imap_new"
+        except Exception as live_exc:
+            logger.debug("[Outlook] Live IMAP(New) token 获取失败，尝试 Entra IMAP token: %s", str(live_exc)[:220])
+            token, _kind = _ms_access_token(account, http=http, preferred_kind="outlook")
+            token_source = "entra_outlook"
         auth_string = f"user={account.email}\x01auth=Bearer {token}\x01\x01"
         mail = imaplib.IMAP4_SSL("outlook.office365.com", 993)
         mail.authenticate("XOAUTH2", lambda _challenge: auth_string.encode("utf-8"))
@@ -688,7 +786,10 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
                 out.append(_imap_msg_to_dict(msg))
             except Exception as exc:
                 logger.debug("[Outlook] 本地 IMAP 解析邮件失败 mid=%s: %s", mid, exc)
-        logger.debug("[Outlook] 本地 IMAP 直连拿到 %s 封邮件", len(out))
+        if token_source == "live_imap_new":
+            logger.info("[Outlook] 本地 IMAP(New) 直连拿到 %s 封邮件", len(out))
+        else:
+            logger.info("[Outlook] 本地 IMAP 直连拿到 %s 封邮件 token_source=%s", len(out), token_source)
         return out
     except Exception as exc:
         logger.warning("[Outlook] 本地 IMAP 直连失败: %s: %s", type(exc).__name__, exc)
@@ -704,6 +805,10 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
 
 def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
     """直连 Microsoft API 读取 Inbox 最新邮件；Graph 不兼容时自动 Outlook REST。"""
+    fatal_reason = _ms_token_fatal_reason(account)
+    if fatal_reason:
+        logger.debug("[Outlook] 跳过 Graph/REST：OAuth 已知不可用：%s", fatal_reason)
+        return []
     http = _ms_http()
     try:
         token, kind = _ms_access_token(account, http=http)
@@ -860,6 +965,7 @@ def fetch_latest_otp(
     best_subject: str = ""
     best_protocol: str = ""
     settle_until: float | None = None # 抓到第一封后，等到这个时刻才返回
+    last_diag_log = 0.0
 
     while time.time() < deadline:
         # 每轮都重新拉，因为可能有新邮件，也可能旧邮件因延迟才出现
@@ -872,6 +978,25 @@ def fetch_latest_otp(
 
         # 按时间降序，最新的在前
         all_candidates.sort(key=lambda x: x[2], reverse=True)
+
+        if all_candidates and not best_otp and time.time() - last_diag_log > 12:
+            diag = []
+            for protocol, item, ts in all_candidates[:5]:
+                subject = str(item.get("subject") or "")[:90]
+                date = item.get("date") or item.get("receivedDateTime") or ""
+                is_openai = looks_like_openai_email(item)
+                after_ok = True if after_ts is None else _is_after(item, after_ts)
+                otp = extract_otp(item)
+                diag.append({
+                    "p": protocol,
+                    "date": date,
+                    "openai": is_openai,
+                    "after": after_ok,
+                    "otp": bool(otp),
+                    "subject": subject,
+                })
+            logger.info("[Outlook] 邮件诊断 top=%s", diag)
+            last_diag_log = time.time()
 
         # 找出本轮"最新一封通过过滤的 OpenAI 邮件"
         for protocol, item, ts in all_candidates:

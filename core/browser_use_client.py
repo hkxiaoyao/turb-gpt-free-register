@@ -49,6 +49,12 @@ class BrowserUseClient:
         if profile_id:
             query["profileId"] = profile_id
 
+        session_timeout = int(getattr(_cfg, "BROWSER_USE_SESSION_TIMEOUT", 180) or 180)
+        if session_timeout > 0:
+            # Browser Use Cloud 对 connect timeout 有服务端上限；超过会在 CDP 连接阶段返回
+            # HTTP 422 less_than_equal 并断开 websocket。这里统一夹到安全范围。
+            query["timeout"] = str(max(60, min(180, session_timeout)))
+
         extra = dict(getattr(_cfg, "BROWSER_USE_EXTRA_QUERY", {}) or {})
         for key, value in extra.items():
             if value is None:
@@ -63,11 +69,12 @@ class BrowserUseClient:
         if "apiKey" in safe_query:
             safe_query["apiKey"] = safe_query["apiKey"][:6] + "***"
         logger.info(
-            "[BrowserUse] CDP connect params: base=%s proxyCountry=%s profileId=%s use_proxy=%s",
+            "[BrowserUse] CDP connect params: base=%s proxyCountry=%s profileId=%s use_proxy=%s timeout=%s",
             base,
             proxy_country or "-",
             profile_id or "-",
             use_proxy,
+            query.get("timeout") or "-",
         )
         logger.debug("[BrowserUse] CDP safe query=%s", safe_query)
         return BrowserUseSession(

@@ -111,7 +111,13 @@ def resolve_email_source(email: str) -> str:
     return parse_email_sources()[0]
 
 
-def wait_for_otp(email: str, after_ts: float) -> str:
+def wait_for_otp(
+    email: str,
+    after_ts: float,
+    max_wait: int | None = None,
+    poll_interval: int | None = None,
+    settle_seconds: int | None = None,
+) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
     USE_EMAIL_SERVICE=False 时走手动验证码通道（WebUI 提交 / CLI 输入），
@@ -126,7 +132,7 @@ def wait_for_otp(email: str, after_ts: float) -> str:
     if not use_service:
         from core.manual_otp import wait_for_manual_otp
         from config import email as _email_cfg
-        timeout = int(getattr(_email_cfg, "OTP_MAX_WAIT", 180) or 180)
+        timeout = int(max_wait if max_wait is not None else (getattr(_email_cfg, "OTP_MAX_WAIT", 180) or 180))
         job_id = None
         try:
             from core import registration_service as svc
@@ -135,24 +141,32 @@ def wait_for_otp(email: str, after_ts: float) -> str:
             job_id = None
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
+    extra_kwargs = {}
+    if max_wait is not None:
+        extra_kwargs["max_wait"] = max_wait
+    if poll_interval is not None:
+        extra_kwargs["poll_interval"] = poll_interval
+    if settle_seconds is not None:
+        extra_kwargs["settle_seconds"] = settle_seconds
+
     source = resolve_email_source(email)
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts)
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "cloudflare_domain":
         from core.qqmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts)
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts)
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts)
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "cloudmail":
         from core.cloudmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts)
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     from core.outlook_client import fetch_latest_otp
-    return fetch_latest_otp(email, after_ts=after_ts)
+    return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
 
 
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:

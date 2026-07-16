@@ -244,6 +244,7 @@ def fetch_latest_otp(
     after_ts: float | None = None,
     max_wait: int | None = None,
     poll_interval: int | None = None,
+    settle_seconds: int | None = None,
 ) -> str:
     """
     通过 QQ 邮箱 IMAP 轮询取 OTP。
@@ -264,7 +265,7 @@ def fetch_latest_otp(
         after_ts = time.time()
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
-    settle = _email_cfg.OTP_SETTLE_SECONDS
+    settle = settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS
     # 30s 时钟偏差容忍
     after_dt = datetime.fromtimestamp(after_ts - 30, tz=timezone.utc)
 

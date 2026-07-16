@@ -119,8 +119,6 @@ def _visible_locator(page, selectors: list[str], timeout_ms: int = 1500):
     for selector in selectors:
         loc = page.locator(selector).first
         try:
-            if loc.count() == 0:
-                continue
             if loc.is_visible(timeout=timeout_ms):
                 return loc
         except Exception:
@@ -210,6 +208,63 @@ def _assert_not_external_idp(page, stage: str) -> None:
         raise RuntimeError(f"[BrowserUse] {stage} 误入第三方登录：{url}")
 
 
+def _quick_auth_state(page) -> dict:
+    """一次 JS 查询判断当前 auth 页面状态，避免多组 locator 逐个等待导致几十秒卡顿。"""
+    try:
+        return page.evaluate(
+            """() => {
+              const url = String(location.href || '').toLowerCase();
+              const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return st && st.visibility !== 'hidden' && st.display !== 'none' && r.width > 0 && r.height > 0;
+              };
+              const q = (s) => !!document.querySelector(s);
+              const qv = (s) => Array.from(document.querySelectorAll(s)).some(visible);
+              const text = (document.body && document.body.innerText || '').toLowerCase();
+              const hasOtp =
+                url.includes('email-verification') ||
+                url.includes('email_otp') ||
+                (url.includes('verify') && url.includes('email')) ||
+                qv("input[name='code']") ||
+                qv("input[name='otp']") ||
+                qv("input[autocomplete='one-time-code']") ||
+                qv("input[inputmode='numeric']") ||
+                qv("input[type='tel']") ||
+                qv("input[maxlength='1']") ||
+                qv("input[data-index]") ||
+                qv("input[aria-label*='code' i]") ||
+                qv("input[aria-label*='digit' i]") ||
+                qv("input[placeholder*='code' i]") ||
+                (
+                  (text.includes('code') || text.includes('verification') || text.includes('verify') ||
+                   text.includes('認証コード') || text.includes('確認コード') || text.includes('コード') ||
+                   text.includes('验证码') || text.includes('驗證碼')) &&
+                  qv("input")
+                );
+              const hasPassword =
+                url.includes('/create-account/password') ||
+                url.includes('/u/signup/password') ||
+                url.includes('/signup/password') ||
+                qv("input[type='password']") ||
+                qv("input[name='password']") ||
+                qv("input[autocomplete='new-password']");
+              let state = 'other';
+              if (hasOtp) state = 'email_verification';
+              else if (url.includes('/log-in/password')) state = 'login_password';
+              else if (hasPassword) state = 'password';
+              else if (url.includes('about-you') || url.includes('profile') || url.includes('create-account/about')) state = 'profile';
+              else if (url.includes('chatgpt.com') && !url.includes('/auth/')) state = 'chatgpt';
+              return {state, url, hasOtp, hasPassword, textPreview: text.slice(0, 160)};
+            }"""
+        ) or {"state": "other", "url": _page_url(page)}
+    except Exception as exc:
+        if _is_target_closed_error(exc):
+            raise
+        return {"state": "other", "url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _type_email(page, email: str) -> None:
     # 有的登录页要先点 “Continue with email”
     _click_first(
@@ -285,6 +340,10 @@ def _type_email(page, email: str) -> None:
 
 
 def _is_password_page(page) -> bool:
+    try:
+        return _quick_auth_state(page).get("state") == "password"
+    except Exception:
+        raise
     url = _page_url(page).lower()
     if any(x in url for x in ("/create-account/password", "/u/signup/password", "/signup/password")):
         return True
@@ -303,6 +362,10 @@ def _is_password_page(page) -> bool:
 
 
 def _is_email_verification_page(page) -> bool:
+    try:
+        return _quick_auth_state(page).get("state") == "email_verification"
+    except Exception:
+        raise
     url = _page_url(page).lower()
     if "email-verification" in url or "email_otp" in url or "verify" in url and "email" in url:
         return True
@@ -320,12 +383,29 @@ def _is_email_verification_page(page) -> bool:
     return loc is not None
 
 
-def _fill_password_if_present(page, email: str, timeout: int = 25) -> str | None:
+def _fill_password_if_present(page, email: str, timeout: int = 25, context=None) -> str | None:
+    started = time.time()
     end = time.time() + timeout
+    last_heartbeat = 0.0
+    last_log = 0.0
     while time.time() < end:
-        if _is_email_verification_page(page):
+        if time.time() - last_heartbeat > 3:
+            page = _browser_use_heartbeat(page, context=context, label="password-detect")
+            last_heartbeat = time.time()
+        state_info = _quick_auth_state(page)
+        state = str(state_info.get("state") or "other")
+        if time.time() - last_log > 3:
+            logger.info("[BrowserUse] 检测密码/验证码页：state=%s url=%s", state, state_info.get("url") or "-")
+            last_log = time.time()
+        if state == "email_verification":
             return None
-        if not _is_password_page(page):
+        if state != "password":
+            # 提交邮箱后如果仍显示 /auth/login 但页面其实已经渲染验证码输入框，
+            # 某些 Browser Use target 上 DOM 状态会短暂滞后。不要在“密码页检测”里长等，
+            # 直接交给后面的 OTP 阶段处理，避免云端会话被拖到关闭。
+            if _fast_mode() and time.time() - started >= 3:
+                logger.info("[BrowserUse] 未检测到密码页，提前进入 OTP 阶段：state=%s url=%s", state, state_info.get("url") or "-")
+                return None
             time.sleep(0.15 if _fast_mode() else 0.4)
             continue
         password = _registration_password()
@@ -852,26 +932,146 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
 
 def _is_target_closed_error(exc: Exception | str) -> bool:
     text = str(exc).lower()
-    return any(x in text for x in ("targetclosed", "target page", "context or browser has been closed", "browser has been closed"))
+    return any(x in text for x in ("targetclosed", "target page", "context or browser has been closed", "browser has been closed", "page.is_closed"))
 
 
 def _pick_live_page(context, preferred=None):
-    """Browser Use 远端有时会关闭当前 target；尽量切到同 context 的可用页面。"""
-    try:
-        if preferred is not None and not preferred.is_closed():
-            return preferred
-    except Exception:
-        pass
+    """Browser Use 远端有时会打开/切换 target；优先选择处在验证码/密码/资料页的活页。"""
+    pages = []
     try:
         for p in list(context.pages):
             try:
                 if not p.is_closed():
-                    return p
+                    pages.append(p)
             except Exception:
                 continue
     except Exception:
         pass
-    return None
+    if preferred is not None:
+        try:
+            if not preferred.is_closed() and preferred not in pages:
+                pages.insert(0, preferred)
+        except Exception:
+            pass
+    if not pages:
+        return None
+    if len(pages) == 1:
+        return pages[0]
+
+    rank = {
+        "email_verification": 100,
+        "password": 90,
+        "profile": 80,
+        "chatgpt": 70,
+        "login_password": 60,
+        "other": 10,
+    }
+    best = pages[0]
+    best_info = {"state": "other", "url": _page_url(best)}
+    best_rank = -1
+    inventory = []
+    for idx, p in enumerate(pages):
+        try:
+            info = _quick_auth_state(p)
+        except Exception:
+            info = {"state": "other", "url": _page_url(p), "error": "state_failed"}
+        state = str(info.get("state") or "other")
+        score = rank.get(state, 0)
+        if p is preferred:
+            score += 1
+        inventory.append(f"#{idx}:{state}:{str(info.get('url') or '-')[:120]}")
+        if score > best_rank:
+            best = p
+            best_info = info
+            best_rank = score
+    if best is not preferred:
+        logger.info(
+            "[BrowserUse] 切换到更匹配的页面：state=%s url=%s pages=%s",
+            best_info.get("state") or "-",
+            best_info.get("url") or "-",
+            inventory,
+        )
+    return best
+
+
+def _browser_use_heartbeat(page, context=None, label: str = ""):
+    """给 Browser Use 云端页面做轻量心跳，并顺便探测 target 是否已被平台关闭。"""
+    if context is not None:
+        live = _pick_live_page(context, page)
+        if live is not None:
+            page = live
+    if page is None:
+        raise RuntimeError("BrowserUse 页面已关闭，无法继续心跳")
+    try:
+        if page.is_closed():
+            raise RuntimeError("BrowserUse page.is_closed()=True")
+    except Exception as exc:
+        if _is_target_closed_error(exc):
+            raise RuntimeError(f"BrowserUse 页面已关闭，无法继续心跳：{exc}") from exc
+    try:
+        # 读 location/visibilityState 足够轻量，不会改变页面状态；比 context.request 更能保持远端 page target 活跃。
+        page.evaluate("() => ({href: location.href, visibility: document.visibilityState, t: Date.now()})", timeout=2500)
+    except TypeError:
+        # 兼容旧 Playwright：evaluate 不支持 timeout 参数。
+        page.evaluate("() => ({href: location.href, visibility: document.visibilityState, t: Date.now()})")
+    except Exception as exc:
+        if _is_target_closed_error(exc):
+            raise RuntimeError(f"BrowserUse 页面已关闭，无法继续心跳：{exc}") from exc
+        logger.debug("[BrowserUse] 心跳失败%s：%s", f"({label})" if label else "", str(exc)[:180])
+    return page
+
+
+def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: float) -> str:
+    """短轮询邮箱 OTP；每轮之间触碰页面，避免 Browser Use Cloud 长时间无页面活动被回收。"""
+    try:
+        from config import email as _email_cfg
+        total_wait = int(getattr(_email_cfg, "OTP_MAX_WAIT", 90) or 90)
+        poll_interval = int(getattr(_email_cfg, "OTP_POLL_INTERVAL", 3) or 3)
+        settle = int(getattr(_email_cfg, "OTP_SETTLE_SECONDS", 5) or 0)
+    except Exception:
+        total_wait, poll_interval, settle = 90, 3, 5
+
+    # 单次邮箱轮询不要阻塞太久，否则云端浏览器这段时间没有任何 page activity。
+    slice_wait = max(6, min(12, total_wait))
+    slice_settle = max(0, min(settle, 2))
+    deadline = time.time() + total_wait
+    last_exc: Exception | None = None
+    attempt = 0
+
+    while time.time() < deadline:
+        _check_manual_stop()
+        attempt += 1
+        page = _browser_use_heartbeat(page, context=context, label=f"otp-before-{attempt}")
+        remaining = max(1, int(deadline - time.time()))
+        wait_this_round = min(slice_wait, remaining)
+        logger.info(
+            "[BrowserUse][OTP] 邮箱短轮询：%s，第 %s 轮，最长 %ss（总剩余 %ss）",
+            email,
+            attempt,
+            wait_this_round,
+            remaining,
+        )
+        try:
+            return wait_for_otp(
+                email,
+                after_ts=after_ts,
+                max_wait=wait_this_round,
+                poll_interval=max(1, min(poll_interval, 3)),
+                settle_seconds=slice_settle,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if _is_target_closed_error(exc):
+                raise
+            if time.time() >= deadline:
+                break
+            logger.info("[BrowserUse][OTP] 本轮未取到验证码，保持云端页面活跃后继续：%s: %s", type(exc).__name__, str(exc)[:220])
+            page = _browser_use_heartbeat(page, context=context, label=f"otp-after-{attempt}")
+            time.sleep(0.5 if _fast_mode() else 1.0)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"等待 {email} 的 OTP 超时（>{total_wait}s）")
 
 
 def _read_chatgpt_session_via_context(context, timeout_ms: int = 5000) -> dict | None:
@@ -1083,28 +1283,51 @@ def run_browser_use_registration(
             _type_email(page, email)
             _t_email.done()
             logger.info("[BrowserUse] 已提交邮箱：%s", email)
+            # OpenAI 可能在提交邮箱后立刻发 OTP。必须从这一刻开始算 after_ts；
+            # 不能等密码页/验证码页检测结束后再记录，否则中间几分钟收到的验证码会被过滤掉。
+            otp_after_ts = time.time()
             _assert_not_external_idp(page, "提交邮箱后")
             _check_manual_stop()
 
-            openai_password = _fill_password_if_present(page, email, timeout=25)
+            _t_pwd = _StepTimer("检测/处理密码页")
+            try:
+                openai_password = _fill_password_if_present(page, email, timeout=8 if _fast_mode() else 15, context=context)
+                _t_pwd.done("password_set=yes" if openai_password else "password_set=no")
+            except Exception as exc:
+                _t_pwd.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
+                raise
             _check_manual_stop()
 
-            otp_after_ts = time.time()
             current_otp = otp_code
             max_otp_attempts = 3
             for otp_attempt in range(1, max_otp_attempts + 1):
                 # 等验证码页出现
                 wait_end = time.time() + (6 if _fast_mode() else 30)
-                while time.time() < wait_end and not _is_email_verification_page(page):
+                last_verify_log = 0.0
+                while time.time() < wait_end:
+                    page = _browser_use_heartbeat(page, context=context, label="wait-email-verification")
+                    state_info = _quick_auth_state(page)
+                    state = str(state_info.get("state") or "other")
+                    if state == "email_verification":
+                        logger.info("[BrowserUse][OTP] 已检测到验证码页：url=%s", state_info.get("url") or "-")
+                        break
                     if any(x in _page_url(page).lower() for x in ("about-you", "profile", "chatgpt.com/")):
                         break
+                    if time.time() - last_verify_log > 5:
+                        logger.info("[BrowserUse][OTP] 等待验证码输入页出现：state=%s url=%s", state, state_info.get("url") or "-")
+                        last_verify_log = time.time()
                     time.sleep(0.2 if _fast_mode() else 0.4)
 
                 if current_otp is None:
                     logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
                     _t_otp_wait = _StepTimer("等待邮箱 OTP")
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
-                    _t_otp_wait.done()
+                    try:
+                        current_otp = _wait_for_otp_with_browser_heartbeat(page, context, email, after_ts=otp_after_ts)
+                        page = _pick_live_page(context, page) or page
+                        _t_otp_wait.done()
+                    except Exception as exc:
+                        _t_otp_wait.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
+                        raise
                 logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
                 _t_otp_submit = _StepTimer("提交邮箱 OTP")
                 _clear_otp_inputs(page)
