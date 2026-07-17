@@ -166,7 +166,8 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
         result = check_account_plan(
             token,
-            proxy=data.get("proxy", None),
+            # 未传 proxy 时使用套餐查询独立网络策略；显式传值仍可覆盖。
+            proxy=data.get("proxy") if "proxy" in data else None,
             timezone_offset_min=str(data.get("timezone_offset_min") or "-"),
         )
         db.update_account_plan_check(acc_id=int(acc.get("id")), result=result)
@@ -185,7 +186,8 @@ def create_app() -> Flask:
         if len(ids) > 500:
             return jsonify({"ok": False, "error": "单次最多查询 500 个账号"}), 400
         workers = max(1, min(16, int(data.get("workers") or 3)))
-        proxy = data.get("proxy", None)
+        # 与单账号查询保持一致：未传时使用独立网络策略。
+        proxy = data.get("proxy") if "proxy" in data else None
         timezone_offset_min = str(data.get("timezone_offset_min") or "-")
 
         items = []
@@ -222,6 +224,8 @@ def create_app() -> Flask:
                 "ok": bool(result.get("ok")),
                 "plan": result.get("current_plan_type"),
                 "plus_trial_eligible": bool(result.get("plus_trial_eligible")),
+                "network_route": result.get("network_route"),
+                "proxy_fallback_reason": result.get("proxy_fallback_reason"),
                 "error": result.get("error"),
             }
 
